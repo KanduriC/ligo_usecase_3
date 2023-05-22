@@ -1,0 +1,8 @@
+concatenated_receptors_file: /doctorai/skanduri/ligo_usecase/witnessrate_0.0001/inst1/exported_dataset/airr/concatenated_flat_receptor_file.tsv
+label_field: "epitope"
+k: 3
+num_processes: 50
+group_field: "repertoire_id"
+n_splits: 5
+pval_threshold: 0.001
+output_path: /doctorai/skanduri/ligo_usecase/mil_witnessrate_0.0001

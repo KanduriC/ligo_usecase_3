@@ -1,0 +1,62 @@
+definitions:
+  datasets:
+    ligo_nonlinear:
+      format: AIRR
+      params:
+        path: /doctorai/skanduri/ligo_usecase/witnessrate_0.001/inst1/exported_dataset/airr/repertoires
+        metadata_file: /doctorai/skanduri/ligo_usecase/witnessrate_0.001/inst1/exported_dataset/airr/repertoires/metadata.csv
+  encodings:
+    feature_size_3:
+      KmerFrequency:
+        k: 3
+        scale_to_unit_variance: True
+        scale_to_zero_mean: True
+  ml_methods:
+    logistic_regression:
+      LogisticRegression:
+        penalty: l1
+        C: [0.1,0.05,0.01,0.001]
+        max_iter: 500
+      model_selection_cv: True
+      model_selection_n_folds: 5
+  reports:
+    my_hp_benchmark: MLSettingsPerformance
+    my_coef_report:
+        Coefficients:
+            coefs_to_plot:
+                - n_largest
+            n_largest: [15]
+    my_motif_report:
+        MotifSeedRecovery:
+            implanted_motifs_per_label:
+                signal_cancer:
+                    seeds: [GDT, SGL]
+                    hamming_distance: False
+                    gap_sizes: [0]
+instructions:
+  hpoptim_instr:
+    assessment:
+      reports:
+        models: [my_coef_report, my_motif_report]
+      split_count: 5
+      split_strategy: k_fold
+      training_percentage: 0.7
+    number_of_processes: 32
+    dataset: ligo_nonlinear
+    labels:
+    - sim_item
+    metrics:
+    - auc
+    - recall
+    optimization_metric: balanced_accuracy
+    reports: [my_hp_benchmark]
+    selection:
+      split_count: 1
+      split_strategy: random
+      training_percentage: 1.0
+    settings:
+    - encoding: feature_size_3
+      ml_method: logistic_regression
+    strategy: GridSearch
+    type: TrainMLModel
+    refit_optimal_model: False

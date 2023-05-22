@@ -1,0 +1,7 @@
+setuptools~=65.5.1
+pandas~=1.5.1
+numpy~=1.23.4
+yaml~=0.2.5
+pyyaml~=6.0
+fisher~=0.1.10
+scikit-learn~=1.2.2

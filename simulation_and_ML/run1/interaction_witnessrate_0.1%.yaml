@@ -1,0 +1,61 @@
+definitions:
+  motifs:
+    motif1:
+      instantiation: GappedKmer
+      seed: GDT
+    motif2:
+      instantiation: GappedKmer
+      seed: SGL
+  signals:
+    signal1:
+      motifs:
+      - motif1
+    signal2:
+      motifs:
+      - motif2
+  simulations:
+    sim1:
+      is_repertoire: true
+      paired: false
+      sequence_type: amino_acid
+      simulation_strategy: RejectionSampling
+      sim_items:
+        AIRR1:
+          generative_model:
+            chain: beta
+            default_model_name: humanTRB
+            model_path: null
+            type: OLGA
+          is_noise: false
+          number_of_examples: 100
+          receptors_in_repertoire_count: 100000
+          seed: 1002
+          signals:
+            signal1__signal2: 0.001
+            signal1: 0.009
+            signal2: 0.009
+        AIRR2:
+          generative_model:
+            chain: beta
+            default_model_name: humanTRB
+            model_path: null
+            type: OLGA
+          is_noise: true
+          number_of_examples: 100
+          receptors_in_repertoire_count: 100000
+          seed: 2
+          signals:
+            signal1__signal2: 0.0001
+            signal1: 0.0099
+            signal2: 0.0099
+instructions:
+  inst1:
+    export_p_gens: false # could take some time to compute (from olga)
+    max_iterations: 10000
+    number_of_processes: 32
+    sequence_batch_size: 100000
+    simulation: sim1
+    store_signal_in_receptors: true
+    type: LigoSim
+output:
+  format: HTML
