@@ -1,15 +1,15 @@
+import argparse
 import pandas as pd
 from multiprocessing import Pool
 import numpy as np
-from collections import Counter
+from collections import Counter, defaultdict
 import itertools
 import os
 import yaml
-import argparse
 from fisher import pvalue_npy
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import StratifiedGroupKFold
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--config_file', help='config file in YAML format containing config for running the classifier')
@@ -22,18 +22,20 @@ def parse_data(concatenated_receptors_file, label_field):
     return df
 
 
-def pairwise_kmer_count(sequences, k):
-    counts = Counter()
-    for seq in sequences:
+def pairwise_kmer_count(sequences, repertoire_ids, k):
+    counts = {}
+    for seq, repertoire_id in zip(sequences, repertoire_ids):
         seq_kmers = set([seq[i:i + k] for i in range(len(seq) - k + 1)])
         seq_pairs = [(x, y) if x < y else (y, x) for x, y in itertools.combinations(seq_kmers, 2) if x != y]
+        if repertoire_id not in counts:
+            counts[repertoire_id] = Counter()
         for pair in seq_pairs:
-            counts[pair] += 1
+            counts[repertoire_id][pair] = 1
     return counts
 
 
-def pairwise_kmer_count_chunked(sequences, k, num_processes):
-    counts = Counter()
+def pairwise_kmer_count_chunked(sequences, repertoire_ids, k, num_processes):
+    counts = {}
     chunk_size = len(sequences) // num_processes
     pool = Pool(num_processes)
     results = []
@@ -41,21 +43,55 @@ def pairwise_kmer_count_chunked(sequences, k, num_processes):
         start_idx = i * chunk_size
         end_idx = start_idx + chunk_size if i < num_processes - 1 else len(sequences)
         chunk_sequences = sequences[start_idx:end_idx]
-        results.append(pool.apply_async(pairwise_kmer_count, (chunk_sequences, k)))
+        chunk_repertoire_ids = repertoire_ids[start_idx:end_idx]
+        results.append(pool.apply_async(pairwise_kmer_count, (chunk_sequences, chunk_repertoire_ids, k)))
     for r in results:
         chunk_counts = r.get()
-        for pair, count in chunk_counts.items():
-            counts[pair] += count
+        for repertoire_id, repertoire_counts in chunk_counts.items():
+            if repertoire_id not in counts:
+                counts[repertoire_id] = Counter()
+            counts[repertoire_id].update(repertoire_counts)
+    pool.close()
+    pool.join()
     return counts
 
 
-def combine_counters(counter1, counter2):
-    pairs = list(set(counter1.keys()) | set(counter2.keys()))
-    pairs.sort()
+def get_unique_pairs_counts(counts):
+    unique_pairs_counts = defaultdict(int)
+    for repertoire_counts in counts.values():
+        for pair in repertoire_counts.keys():
+            unique_pairs_counts[pair] += 1
+    return unique_pairs_counts
+
+
+def get_pairwise_kmer_counts(receptor_file, label_field, target_label, k, num_processes):
+    unique_df = receptor_file.drop_duplicates(subset='repertoire_id')
+    label_counts = unique_df[label_field].value_counts().to_dict()
+    airr1 = receptor_file.loc[receptor_file[label_field] == target_label, ['junction_aa', 'repertoire_id']]
+    airr1_seq = airr1['junction_aa'].values
+    airr1_reps = airr1['repertoire_id'].values
+    airr1_pairwise_counts = pairwise_kmer_count_chunked(airr1_seq, airr1_reps, k, num_processes)
+    airr1_pairwise_counts = get_unique_pairs_counts(airr1_pairwise_counts)
+    airr2 = receptor_file.loc[receptor_file[label_field] != target_label, ['junction_aa', 'repertoire_id']]
+    airr2_seq = airr2['junction_aa'].values
+    airr2_reps = airr2['repertoire_id'].values
+    airr2_pairwise_counts = pairwise_kmer_count_chunked(airr2_seq, airr2_reps, k, num_processes)
+    airr2_pairwise_counts = get_unique_pairs_counts(airr2_pairwise_counts)
+    print("combining counters: ---------")
+    pair_counts = combine_defaultdicts(airr1_pairwise_counts, airr2_pairwise_counts)
+    n1 = label_counts[target_label]
+    n2 = label_counts[list(set(label_counts.keys()).difference(set([config['target_label']])))[0]]
+    print("performing fishers exact test: ---------")
+    pair_counts = fisher_exact_test(pair_counts, n1=n1, n2=n2)
+    return airr1_seq, airr2_seq, pair_counts, n1, n2
+
+
+def combine_defaultdicts(dict1, dict2):
+    unique_pairs = set(dict1.keys()) | set(dict2.keys())
     data = []
-    for pair in pairs:
-        count1 = counter1[pair] if pair in counter1 else 0
-        count2 = counter2[pair] if pair in counter2 else 0
+    for pair in unique_pairs:
+        count1 = dict1[pair] if pair in dict1 else 0
+        count2 = dict2[pair] if pair in dict2 else 0
         data.append([pair, pair[0], pair[1], count1, count2])
     df = pd.DataFrame(data, columns=['pair', 'kmer1', 'kmer2', 'class1_pos', 'class2_pos'])
     df.set_index('pair', inplace=True)
@@ -76,61 +112,72 @@ def fisher_exact_test(df, n1, n2):
     return df.drop(['class1_neg', 'class2_neg'], axis=1)
 
 
-def score_sequences(sequences, k, significant_pairs):
+def score_sequences(sequences, k, significant_pairs, num_processes):
     significant_pairs = set(significant_pairs)
     scores = np.zeros(len(sequences))
-    for i, seq in enumerate(sequences):
-        seq_kmers = set([seq[i:i + k] for i in range(len(seq) - k + 1)])
-        seq_pairs = set([(x, y) if x < y else (y, x) for x, y in itertools.combinations(seq_kmers, 2) if x != y])
-        if len(set.intersection(significant_pairs, seq_pairs)) > 0:
-            scores[i] = 1
+    chunk_size = len(sequences) // num_processes
+    pool = Pool(num_processes)
+    results = []
+    for i in range(num_processes):
+        start_idx = i * chunk_size
+        end_idx = start_idx + chunk_size if i < num_processes - 1 else len(sequences)
+        chunk_sequences = sequences[start_idx:end_idx]
+        results.append(
+            pool.apply_async(compute_scores_chunk, (chunk_sequences, k, significant_pairs, start_idx, end_idx)))
+    for r in results:
+        chunk_scores, start_idx, end_idx = r.get()
+        scores[start_idx:end_idx] += chunk_scores
     return scores
 
 
-def get_unique_repertoire_int_ids(receptor_file, label_field, label):
-    reps = receptor_file.loc[receptor_file[label_field] == label, 'repertoire_id'].values
-    id_map = {id_: i for i, id_ in enumerate(set(reps))}
+def compute_scores_chunk(sequences, k, significant_pairs, start_idx, end_idx):
+    chunk_scores = np.zeros(len(sequences))
+    for i, seq in enumerate(sequences):
+        seq_kmers = set([seq[j:j + k] for j in range(len(seq) - k + 1)])
+        seq_pairs = set([(x, y) if x < y else (y, x) for x, y in itertools.combinations(seq_kmers, 2) if x != y])
+        n_pairs_intersect = len(set.intersection(significant_pairs, seq_pairs))
+        if n_pairs_intersect > 0:
+            chunk_scores[i] = n_pairs_intersect
+    return chunk_scores, start_idx, end_idx
+
+
+def get_unique_repertoire_int_ids(receptor_file):
+    print("returning int ids: ---------")
+    reps = receptor_file['repertoire_id'].values
+    epitopes = receptor_file['epitope'].values
+    unique_reps = list(set(reps))
+    id_map = {id_: i for i, id_ in enumerate(unique_reps)}
     int_ids = [id_map[id_] for id_ in reps]
-    return int_ids
+    print("computing nd returning unique epitopes: ---------")
+    epitope_dict = {}
+    for id_, epitope in zip(reps, epitopes):
+        if id_ not in epitope_dict:
+            epitope_dict[id_] = epitope
+
+    unique_epitopes = [epitope_dict[id_] for id_ in unique_reps]
+    #     unique_epitopes = np.asarray(unique_epitopes, dtype=int)
+    return int_ids, unique_epitopes
 
 
-def get_pairwise_kmer_counts(receptor_file, label_field, k, num_processes):
-    receptor_file = receptor_file.sort_values(label_field)
-    label_counts = receptor_file[label_field].value_counts().to_dict()
-    labels = list(label_counts.keys())
-    labels.sort()
-    if len(labels) != 2:
-        raise ValueError("Two unique labels are required")
-    airr1_seq = receptor_file.loc[receptor_file[label_field] == labels[0], 'junction_aa'].values
-    airr1_pairwise_counts = pairwise_kmer_count_chunked(airr1_seq, k, num_processes)
-    airr2_seq = receptor_file.loc[receptor_file[label_field] == labels[1], 'junction_aa'].values
-    airr2_pairwise_counts = pairwise_kmer_count_chunked(airr2_seq, k, num_processes)
-    pair_counts = combine_counters(airr1_pairwise_counts, airr2_pairwise_counts)
-    pair_counts = fisher_exact_test(pair_counts, n1=label_counts[labels[0]], n2=label_counts[labels[1]])
-    return airr1_seq, airr2_seq, pair_counts
+def get_significant_pairs(pair_counts, top_n, neg_class_size=None):
+    print("returning significant pairs: ---------")
+    pair_counts_sorted = pair_counts.sort_values("p_value", ascending=True)
+    pair_counts_sorted = pair_counts_sorted[pair_counts_sorted["odds_ratio"] > 2]
+    if neg_class_size is not None:
+        neg_class_threshold = int(neg_class_size * 0.03)
+        pair_counts_sorted = pair_counts_sorted[pair_counts_sorted["class2_pos"] < neg_class_threshold]
+    significant_pairs = pair_counts_sorted.head(n=top_n).index.values
+    return significant_pairs
 
 
-def get_significant_pairs(pair_counts, pval_threshold):
-    pval_filtered = pair_counts[pair_counts["p_value"] < pval_threshold]
-    pval_filtered = pval_filtered[pval_filtered["odds_ratio"] > 2]
-    return pval_filtered.index.values
-
-
-def get_pos_instance_counts(class1_seq, class2_seq, k, significant_pairs, receptor_file, label_field):
-    airr1_seq_scores = score_sequences(class1_seq, k, significant_pairs)
-    airr2_seq_scores = score_sequences(class2_seq, k, significant_pairs)
-    class1_pos_instances = class1_seq[np.nonzero(airr1_seq_scores)]
-    class2_pos_instances = class2_seq[np.nonzero(airr2_seq_scores)]
-    labels = list(receptor_file[label_field].value_counts().to_dict().keys())
-    labels.sort()
-    class1_int_ids = get_unique_repertoire_int_ids(receptor_file, label_field=label_field, label=labels[0])
-    class2_int_ids = get_unique_repertoire_int_ids(receptor_file, label_field=label_field, label=labels[1])
-    class1_pos_inst_counts = np.bincount(class1_int_ids, weights=airr1_seq_scores)
-    class2_pos_inst_counts = np.bincount(class2_int_ids, weights=airr2_seq_scores)
-    class_labels = np.concatenate((np.repeat(labels[0], len(class1_pos_inst_counts)),
-                                   np.repeat(labels[1], len(class2_pos_inst_counts))))
-    pos_inst_counts = np.concatenate((class1_pos_inst_counts, class2_pos_inst_counts))
-    return pos_inst_counts, class_labels, class1_pos_instances, class2_pos_instances
+def get_pos_instance_counts(receptor_file, k, significant_pairs, num_processes):
+    seq = receptor_file['junction_aa'].values
+    print("scoring all sequences: ---------")
+    seq_scores = score_sequences(seq, k, significant_pairs, num_processes)
+    pos_instances = seq[np.nonzero(seq_scores)]
+    int_ids, unique_epitopes = get_unique_repertoire_int_ids(receptor_file)
+    pos_inst_counts = np.bincount(int_ids, weights=seq_scores)
+    return pos_inst_counts, pos_instances, unique_epitopes
 
 
 def fit_model(pos_inst_counts, class_labels):
@@ -138,38 +185,42 @@ def fit_model(pos_inst_counts, class_labels):
     return clf
 
 
-def classifier(receptor_file, label_field, k, num_processes, group_field, n_splits, pval_threshold):
+def classifier(receptor_file, label_field, target_label, k, num_processes, top_n, group_field, n_splits,
+               filter_by_neg_class_size=None):
     y = receptor_file[label_field]
     groups = receptor_file[group_field]
-    gkf = GroupKFold(n_splits=n_splits)
+    sgkf = StratifiedGroupKFold(n_splits=n_splits)
     balanced_accuracy_scores = []
     detailed_results = {}
-    for i, (train_idx, test_idx) in enumerate(gkf.split(receptor_file, y, groups)):
+    for i, (train_idx, test_idx) in enumerate(sgkf.split(receptor_file, y, groups)):
         X_train, X_test = receptor_file.iloc[train_idx], receptor_file.iloc[test_idx]
+        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
-        airr1_seq, airr2_seq, pair_counts = get_pairwise_kmer_counts(X_train, label_field=label_field, k=k,
-                                                                     num_processes=num_processes)
-        significant_pairs = get_significant_pairs(pair_counts, pval_threshold)
-        pos_inst_counts, class_labels, class1_pos_instances, class2_pos_instances = get_pos_instance_counts(airr1_seq,
-                                                                                                            airr2_seq,
-                                                                                                            k,
-                                                                                                            significant_pairs,
-                                                                                                            X_train,
-                                                                                                            label_field)
-        fitted_model_ = fit_model(pos_inst_counts.reshape(-1, 1), class_labels)
+        airr1_seq, airr2_seq, pair_counts, n1, n2 = get_pairwise_kmer_counts(X_train, label_field=label_field,
+                                                                             target_label=target_label, k=k,
+                                                                             num_processes=num_processes)
+        if filter_by_neg_class_size is not None:
+            significant_pairs = get_significant_pairs(pair_counts, top_n=top_n, neg_class_size=n2)
+        else:
+            significant_pairs = get_significant_pairs(pair_counts, top_n=top_n, neg_class_size=None)
+        pos_inst_counts, pos_instances, class_labels = get_pos_instance_counts(X_train, k, significant_pairs,
+                                                                               num_processes)
+        fitted_model_ = fit_model(pos_inst_counts.reshape(-1, 1), np.array(class_labels))
 
-        test_airr1_seq, test_airr2_seq, test_pair_counts = get_pairwise_kmer_counts(X_test, label_field=label_field,
-                                                                                    k=k, num_processes=num_processes)
-        test_pos_inst_counts, test_class_labels, test_class1_pos_instances, test_class2_pos_instances = get_pos_instance_counts(
-            test_airr1_seq, test_airr2_seq, k, significant_pairs, X_test, label_field)
+        test_pos_inst_counts, test_pos_instances, test_class_labels = get_pos_instance_counts(X_test, k,
+                                                                                              significant_pairs,
+                                                                                              num_processes)
 
         predicted_test_labels = fitted_model_.predict(test_pos_inst_counts.reshape(-1, 1))
-        balanced_accuracy_scores.append(balanced_accuracy_score(test_class_labels, predicted_test_labels))
-        pos_instances = {"train_class1": class1_pos_instances, "train_class2": class2_pos_instances,
-                         "test_class1": test_class1_pos_instances, "test_class2": test_class2_pos_instances}
+        test_rep_ids, true_test_labels = get_unique_repertoire_int_ids(X_test)
+        balanced_accuracy_scores.append(
+            balanced_accuracy_score(np.array(true_test_labels), np.array(predicted_test_labels)))
+        pos_instances = {"train_pos_instances": pos_instances, "test_pos_instances": test_pos_instances}
+
         detailed_results[f"split_{i}"] = {"significant_pairs": significant_pairs, "pos_inst_counts": pos_inst_counts,
-                                          "class_labels": class_labels, "test_pos_inst_counts": test_pos_inst_counts,
-                                          "test_class_labels": test_class_labels,
+                                          "class_labels": X_train[label_field].values,
+                                          "test_pos_inst_counts": test_pos_inst_counts,
+                                          "test_class_labels": X_test[label_field].values,
                                           "predicted_test_labels": predicted_test_labels,
                                           "pair_counts": pair_counts, "positive_instances": pos_instances}
         detailed_results["crossval_balanced_accuracy_scores"] = balanced_accuracy_scores
@@ -206,9 +257,11 @@ def execute():
                                label_field=config['label_field'])
     detailed_results = classifier(receptor_file,
                                   label_field=config['label_field'],
+                                  target_label=config['target_label'],
                                   k=config['k'],
                                   num_processes=config['num_processes'],
+                                  top_n=config['top_n'],
                                   group_field=config['group_field'],
                                   n_splits=config['n_splits'],
-                                  pval_threshold=config['pval_threshold'])
+                                  filter_by_neg_class_size=None)
     write_nested_dict_to_files(data=detailed_results, path=config['output_path'], delimiter="\t")
