@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 import itertools
 import os
 import yaml
+import logging
 from fisher import pvalue_npy
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score
@@ -77,11 +78,9 @@ def get_pairwise_kmer_counts(receptor_file, label_field, target_label, k, num_pr
     airr2_reps = airr2['repertoire_id'].values
     airr2_pairwise_counts = pairwise_kmer_count_chunked(airr2_seq, airr2_reps, k, num_processes)
     airr2_pairwise_counts = get_unique_pairs_counts(airr2_pairwise_counts)
-    print("combining counters: ---------")
     pair_counts = combine_defaultdicts(airr1_pairwise_counts, airr2_pairwise_counts)
     n1 = label_counts[target_label]
-    n2 = label_counts[list(set(label_counts.keys()).difference(set([config['target_label']])))[0]]
-    print("performing fishers exact test: ---------")
+    n2 = label_counts[list(set(label_counts.keys()).difference(set([target_label])))[0]]
     pair_counts = fisher_exact_test(pair_counts, n1=n1, n2=n2)
     return airr1_seq, airr2_seq, pair_counts, n1, n2
 
@@ -142,25 +141,21 @@ def compute_scores_chunk(sequences, k, significant_pairs, start_idx, end_idx):
 
 
 def get_unique_repertoire_int_ids(receptor_file):
-    print("returning int ids: ---------")
     reps = receptor_file['repertoire_id'].values
     epitopes = receptor_file['epitope'].values
     unique_reps = list(set(reps))
     id_map = {id_: i for i, id_ in enumerate(unique_reps)}
     int_ids = [id_map[id_] for id_ in reps]
-    print("computing nd returning unique epitopes: ---------")
     epitope_dict = {}
     for id_, epitope in zip(reps, epitopes):
         if id_ not in epitope_dict:
             epitope_dict[id_] = epitope
 
     unique_epitopes = [epitope_dict[id_] for id_ in unique_reps]
-    #     unique_epitopes = np.asarray(unique_epitopes, dtype=int)
     return int_ids, unique_epitopes
 
 
 def get_significant_pairs(pair_counts, top_n, neg_class_size=None):
-    print("returning significant pairs: ---------")
     pair_counts_sorted = pair_counts.sort_values("p_value", ascending=True)
     pair_counts_sorted = pair_counts_sorted[pair_counts_sorted["odds_ratio"] > 2]
     if neg_class_size is not None:
@@ -172,7 +167,6 @@ def get_significant_pairs(pair_counts, top_n, neg_class_size=None):
 
 def get_pos_instance_counts(receptor_file, k, significant_pairs, num_processes):
     seq = receptor_file['junction_aa'].values
-    print("scoring all sequences: ---------")
     seq_scores = score_sequences(seq, k, significant_pairs, num_processes)
     pos_instances = seq[np.nonzero(seq_scores)]
     int_ids, unique_epitopes = get_unique_repertoire_int_ids(receptor_file)
@@ -193,8 +187,8 @@ def classifier(receptor_file, label_field, target_label, k, num_processes, top_n
     balanced_accuracy_scores = []
     detailed_results = {}
     for i, (train_idx, test_idx) in enumerate(sgkf.split(receptor_file, y, groups)):
+        logging.info(f"Processing split: {i}")
         X_train, X_test = receptor_file.iloc[train_idx], receptor_file.iloc[test_idx]
-        y_train, y_test = y.iloc[train_idx], y.iloc[test_idx]
 
         airr1_seq, airr2_seq, pair_counts, n1, n2 = get_pairwise_kmer_counts(X_train, label_field=label_field,
                                                                              target_label=target_label, k=k,
@@ -203,10 +197,11 @@ def classifier(receptor_file, label_field, target_label, k, num_processes, top_n
             significant_pairs = get_significant_pairs(pair_counts, top_n=top_n, neg_class_size=n2)
         else:
             significant_pairs = get_significant_pairs(pair_counts, top_n=top_n, neg_class_size=None)
+        logging.info(f"Counting positive instances in training in split: {i}")
         pos_inst_counts, pos_instances, class_labels = get_pos_instance_counts(X_train, k, significant_pairs,
                                                                                num_processes)
         fitted_model_ = fit_model(pos_inst_counts.reshape(-1, 1), np.array(class_labels))
-
+        logging.info(f"Counting positive instances in testdata in split: {i}")
         test_pos_inst_counts, test_pos_instances, test_class_labels = get_pos_instance_counts(X_test, k,
                                                                                               significant_pairs,
                                                                                               num_processes)
@@ -251,8 +246,17 @@ def read_yaml_config(file_path):
     return config
 
 
+def _initialize_logging(log_file_path):
+    log_format = logging.Formatter('%(asctime)s: %(levelname)s: %(message)s')
+    logging.basicConfig(format='%(asctime)s: %(levelname)s: %(message)s', level=logging.DEBUG,
+                        filename=log_file_path, filemode='a')
+
+
 def execute():
     config = read_yaml_config(args.config_file)
+    log_fn = os.path.join(os.path.dirname(args.config_file), os.path.splitext(os.path.basename(args.config_file))[0] +
+                          "_log.txt")
+    _initialize_logging(log_file_path=log_fn)
     receptor_file = parse_data(concatenated_receptors_file=config['concatenated_receptors_file'],
                                label_field=config['label_field'])
     detailed_results = classifier(receptor_file,
@@ -264,4 +268,5 @@ def execute():
                                   group_field=config['group_field'],
                                   n_splits=config['n_splits'],
                                   filter_by_neg_class_size=None)
+    logging.info('Writing results to disk')
     write_nested_dict_to_files(data=detailed_results, path=config['output_path'], delimiter="\t")
