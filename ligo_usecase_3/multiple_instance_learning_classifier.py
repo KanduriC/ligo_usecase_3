@@ -9,7 +9,7 @@ import argparse
 from fisher import pvalue_npy
 from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import balanced_accuracy_score
-from sklearn.model_selection import GroupKFold
+from sklearn.model_selection import StratifiedGroupKFold
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--config_file', help='config file in YAML format containing config for running the classifier')
@@ -76,22 +76,48 @@ def fisher_exact_test(df, n1, n2):
     return df.drop(['class1_neg', 'class2_neg'], axis=1)
 
 
-def score_sequences(sequences, k, significant_pairs):
+def score_sequences(sequences, k, significant_pairs, num_processes):
     significant_pairs = set(significant_pairs)
     scores = np.zeros(len(sequences))
-    for i, seq in enumerate(sequences):
-        seq_kmers = set([seq[i:i + k] for i in range(len(seq) - k + 1)])
-        seq_pairs = set([(x, y) if x < y else (y, x) for x, y in itertools.combinations(seq_kmers, 2) if x != y])
-        if len(set.intersection(significant_pairs, seq_pairs)) > 0:
-            scores[i] = 1
+    chunk_size = len(sequences) // num_processes
+    pool = Pool(num_processes)
+    results = []
+    for i in range(num_processes):
+        start_idx = i * chunk_size
+        end_idx = start_idx + chunk_size if i < num_processes - 1 else len(sequences)
+        chunk_sequences = sequences[start_idx:end_idx]
+        results.append(
+            pool.apply_async(compute_scores_chunk, (chunk_sequences, k, significant_pairs, start_idx, end_idx)))
+    for r in results:
+        chunk_scores, start_idx, end_idx = r.get()
+        scores[start_idx:end_idx] += chunk_scores
     return scores
 
 
-def get_unique_repertoire_int_ids(receptor_file, label_field, label):
-    reps = receptor_file.loc[receptor_file[label_field] == label, 'repertoire_id'].values
-    id_map = {id_: i for i, id_ in enumerate(set(reps))}
+def compute_scores_chunk(sequences, k, significant_pairs, start_idx, end_idx):
+    chunk_scores = np.zeros(len(sequences))
+    for i, seq in enumerate(sequences):
+        seq_kmers = set([seq[j:j + k] for j in range(len(seq) - k + 1)])
+        seq_pairs = set([(x, y) if x < y else (y, x) for x, y in itertools.combinations(seq_kmers, 2) if x != y])
+        n_pairs_intersect = len(set.intersection(significant_pairs, seq_pairs))
+        if n_pairs_intersect > 0:
+            chunk_scores[i] = n_pairs_intersect
+    return chunk_scores, start_idx, end_idx
+
+
+def get_unique_repertoire_int_ids(receptor_file):
+    reps = receptor_file['repertoire_id'].values
+    epitopes = receptor_file['epitope'].values
+    unique_reps = list(set(reps))
+    id_map = {id_: i for i, id_ in enumerate(unique_reps)}
     int_ids = [id_map[id_] for id_ in reps]
-    return int_ids
+    epitope_dict = {}
+    for id_, epitope in zip(reps, epitopes):
+        if id_ not in epitope_dict:
+            epitope_dict[id_] = epitope
+
+    unique_epitopes = [epitope_dict[id_] for id_ in unique_reps]
+    return int_ids, unique_epitopes
 
 
 def get_pairwise_kmer_counts(receptor_file, label_field, k, num_processes):
@@ -116,21 +142,13 @@ def get_significant_pairs(pair_counts, pval_threshold):
     return pval_filtered.index.values
 
 
-def get_pos_instance_counts(class1_seq, class2_seq, k, significant_pairs, receptor_file, label_field):
-    airr1_seq_scores = score_sequences(class1_seq, k, significant_pairs)
-    airr2_seq_scores = score_sequences(class2_seq, k, significant_pairs)
-    class1_pos_instances = class1_seq[np.nonzero(airr1_seq_scores)]
-    class2_pos_instances = class2_seq[np.nonzero(airr2_seq_scores)]
-    labels = list(receptor_file[label_field].value_counts().to_dict().keys())
-    labels.sort()
-    class1_int_ids = get_unique_repertoire_int_ids(receptor_file, label_field=label_field, label=labels[0])
-    class2_int_ids = get_unique_repertoire_int_ids(receptor_file, label_field=label_field, label=labels[1])
-    class1_pos_inst_counts = np.bincount(class1_int_ids, weights=airr1_seq_scores)
-    class2_pos_inst_counts = np.bincount(class2_int_ids, weights=airr2_seq_scores)
-    class_labels = np.concatenate((np.repeat(labels[0], len(class1_pos_inst_counts)),
-                                   np.repeat(labels[1], len(class2_pos_inst_counts))))
-    pos_inst_counts = np.concatenate((class1_pos_inst_counts, class2_pos_inst_counts))
-    return pos_inst_counts, class_labels, class1_pos_instances, class2_pos_instances
+def get_pos_instance_counts(receptor_file, k, significant_pairs, num_processes):
+    seq = receptor_file['junction_aa'].values
+    seq_scores = score_sequences(seq, k, significant_pairs, num_processes)
+    pos_instances = seq[np.nonzero(seq_scores)]
+    int_ids, unique_epitopes = get_unique_repertoire_int_ids(receptor_file)
+    pos_inst_counts = np.bincount(int_ids, weights=seq_scores)
+    return pos_inst_counts, pos_instances, unique_epitopes
 
 
 def fit_model(pos_inst_counts, class_labels):
@@ -141,32 +159,27 @@ def fit_model(pos_inst_counts, class_labels):
 def classifier(receptor_file, label_field, k, num_processes, group_field, n_splits, pval_threshold):
     y = receptor_file[label_field]
     groups = receptor_file[group_field]
-    gkf = GroupKFold(n_splits=n_splits)
+    sgkf = StratifiedGroupKFold(n_splits=n_splits)
     balanced_accuracy_scores = []
     detailed_results = {}
-    for i, (train_idx, test_idx) in enumerate(gkf.split(receptor_file, y, groups)):
+    for i, (train_idx, test_idx) in enumerate(sgkf.split(receptor_file, y, groups)):
         X_train, X_test = receptor_file.iloc[train_idx], receptor_file.iloc[test_idx]
 
         airr1_seq, airr2_seq, pair_counts = get_pairwise_kmer_counts(X_train, label_field=label_field, k=k,
                                                                      num_processes=num_processes)
         significant_pairs = get_significant_pairs(pair_counts, pval_threshold)
-        pos_inst_counts, class_labels, class1_pos_instances, class2_pos_instances = get_pos_instance_counts(airr1_seq,
-                                                                                                            airr2_seq,
-                                                                                                            k,
-                                                                                                            significant_pairs,
-                                                                                                            X_train,
-                                                                                                            label_field)
-        fitted_model_ = fit_model(pos_inst_counts.reshape(-1, 1), class_labels)
+        pos_inst_counts, pos_instances, class_labels = get_pos_instance_counts(X_train, k, significant_pairs,
+                                                                               num_processes)
+        fitted_model_ = fit_model(pos_inst_counts.reshape(-1, 1), np.array(class_labels))
 
-        test_airr1_seq, test_airr2_seq, test_pair_counts = get_pairwise_kmer_counts(X_test, label_field=label_field,
-                                                                                    k=k, num_processes=num_processes)
-        test_pos_inst_counts, test_class_labels, test_class1_pos_instances, test_class2_pos_instances = get_pos_instance_counts(
-            test_airr1_seq, test_airr2_seq, k, significant_pairs, X_test, label_field)
+        test_pos_inst_counts, test_pos_instances, test_class_labels = get_pos_instance_counts(X_test, k,
+                                                                                              significant_pairs,
+                                                                                              num_processes)
 
         predicted_test_labels = fitted_model_.predict(test_pos_inst_counts.reshape(-1, 1))
-        balanced_accuracy_scores.append(balanced_accuracy_score(test_class_labels, predicted_test_labels))
-        pos_instances = {"train_class1": class1_pos_instances, "train_class2": class2_pos_instances,
-                         "test_class1": test_class1_pos_instances, "test_class2": test_class2_pos_instances}
+        test_rep_ids, true_test_labels = get_unique_repertoire_int_ids(X_test)
+        balanced_accuracy_scores.append(balanced_accuracy_score(np.array(true_test_labels), np.array(predicted_test_labels)))
+        pos_instances = {"train_pos_instances": pos_instances, "test_pos_instances": test_pos_instances}
         detailed_results[f"split_{i}"] = {"significant_pairs": significant_pairs, "pos_inst_counts": pos_inst_counts,
                                           "class_labels": class_labels, "test_pos_inst_counts": test_pos_inst_counts,
                                           "test_class_labels": test_class_labels,
